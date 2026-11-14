@@ -381,6 +381,7 @@ pub fn generate_compile_commands(
         env_vars: env_vars.to_owned(),
         cwd: cwd.to_owned(),
         share_jobserver: false,
+        rust_response_file: false,
     };
 
     Ok((command, None, Cacheable::Yes))

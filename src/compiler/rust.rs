@@ -456,8 +456,9 @@ where
         .context("Failed to create temp dir")?;
     let dep_file = temp_dir.path().join("deps.d");
     let mut cmd = creator.clone().new_command_sync(executable);
-    cmd.args(arguments)
-        .args(&["--emit", "dep-info"])
+    let (arguments, _response_dir) = maybe_rust_response_file(arguments)?;
+    cmd.args(&arguments);
+    cmd.args(&["--emit", "dep-info"])
         .arg("-o")
         .arg(&dep_file)
         .env_clear()
@@ -792,13 +793,15 @@ where
 {
     let start = time::Instant::now();
     let mut cmd = creator.clone().new_command_sync(executable);
-    cmd.args(&arguments)
-        .args(&["--print", "file-names"])
+    let (arguments, response_dir) = maybe_rust_response_file(&arguments)?;
+    cmd.args(&arguments);
+    cmd.args(&["--print", "file-names"])
         .env_clear()
         .envs(env_vars.to_vec())
         .current_dir(cwd);
     trace!("get_compiler_outputs: {:?}", cmd);
     let outputs = run_input_output(cmd, None).await?;
+    drop(response_dir);
 
     let outstr = String::from_utf8(outputs.stdout).context("Error parsing rustc output")?;
     let outputs = outstr.lines().map(|l| l.to_owned()).collect::<Vec<_>>();
@@ -1501,6 +1504,51 @@ fn split_rust_response_file_args(contents: &str) -> Vec<OsString> {
         .filter(|line| !line.is_empty())
         .map(OsString::from)
         .collect()
+}
+
+/// Move a long rustc invocation into a response file on Windows.
+/// rustc's line-based format cannot represent empty arguments or surrounding
+/// whitespace, so reject those cases instead of silently changing arguments.
+pub(super) fn maybe_rust_response_file(
+    arguments: &[OsString],
+) -> Result<(Vec<OsString>, Option<tempfile::TempDir>)> {
+    const WINDOWS_COMMAND_LIMIT: usize = 24_000;
+
+    if !cfg!(windows)
+        || arguments
+            .iter()
+            .map(|arg| arg.to_string_lossy().encode_utf16().count() + 3)
+            .sum::<usize>()
+            <= WINDOWS_COMMAND_LIMIT
+    {
+        return Ok((arguments.to_vec(), None));
+    }
+
+    let contents = rust_response_file_contents(arguments)?;
+
+    let dir = tempfile::Builder::new()
+        .prefix("sccache-rust-args")
+        .tempdir()?;
+    let path = dir.path().join("rustc.args");
+    fs::write(&path, contents)?;
+    Ok((vec![format!("@{}", path.display()).into()], Some(dir)))
+}
+
+fn rust_response_file_contents(arguments: &[OsString]) -> Result<String> {
+    let mut contents = String::new();
+    for arg in arguments {
+        let arg = arg
+            .to_str()
+            .context("Rust response file argument is not UTF-8")?;
+        if arg.is_empty() || arg.trim() != arg || arg.contains('\r') || arg.contains('\n') {
+            anyhow::bail!(
+                "Rust response file cannot represent an argument with leading/trailing whitespace or a newline"
+            );
+        }
+        contents.push_str(arg);
+        contents.push('\n');
+    }
+    Ok(contents)
 }
 
 pub struct ExpandResponseFile<'a> {
@@ -2314,6 +2362,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             // spawns as many threads as there are CPUs, which is the
             // oversubscription sccache's own jobserver exists to prevent.
             share_jobserver: true,
+            rust_response_file: true,
         };
 
         #[cfg(not(feature = "dist-client"))]
@@ -5069,6 +5118,34 @@ foo.rs:
             ovec!["--emit", "foo.rs"],
             split_rust_response_file_args("--emit\r\nfoo.rs\r\n")
         );
+    }
+
+    #[test]
+    fn test_rust_response_file_contents_preserves_supported_arguments() {
+        let mut args: Vec<OsString> = vec![
+            "--extern".into(),
+            "crate=C:\\path with spaces\\lib.rlib".into(),
+            "-Cmetadata=quoted\"value\"".into(),
+        ];
+        args.push(
+            format!(
+                "-Ldependency=C:\\unicode-{}\\deps",
+                char::from_u32(0x96ea).unwrap()
+            )
+            .into(),
+        );
+        let contents = rust_response_file_contents(&args).unwrap();
+        assert_eq!(args, split_rust_response_file_args(&contents));
+    }
+
+    #[test]
+    fn test_rust_response_file_contents_rejects_unrepresentable_arguments() {
+        for arg in ["", " leading", "trailing ", "line\nbreak", "line\rbreak"] {
+            assert!(
+                rust_response_file_contents(&vec![arg.into()]).is_err(),
+                "{arg:?}"
+            );
+        }
     }
 
     #[test]

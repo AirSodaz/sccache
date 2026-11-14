@@ -27,6 +27,7 @@ use crate::compiler::nvcc::Nvcc;
 use crate::compiler::nvcc::NvccHostCompiler;
 use crate::compiler::nvhpc::Nvhpc;
 use crate::compiler::ptxas::Ptxas;
+use crate::compiler::rust;
 use crate::compiler::rust::{Rust, RustupProxy};
 use crate::compiler::tasking_vx::TaskingVX;
 #[cfg(feature = "dist-client")]
@@ -178,6 +179,7 @@ pub struct SingleCompileCommand {
     /// costs a `fork` per compile; in the `false` direction it costs `rustc`
     /// its parallelism limit, which is what the jobserver exists to enforce.
     pub share_jobserver: bool,
+    pub rust_response_file: bool,
 }
 
 #[async_trait]
@@ -209,18 +211,24 @@ impl CompileCommandImpl for SingleCompileCommand {
             env_vars,
             cwd,
             share_jobserver,
+            rust_response_file,
         } = self;
         // Resolve compiler avoiding ccache wrappers to prevent double-caching.
         let resolved_executable = resolve_compiler_avoiding_wrapper(executable, env_vars);
         let mut cmd = creator.clone().new_command_sync(&resolved_executable);
-        cmd.args(arguments)
-            .env_clear()
-            .envs(env_vars.clone())
-            .current_dir(cwd);
+        let response_dir = if *rust_response_file {
+            let (arguments, response_dir) = rust::maybe_rust_response_file(arguments)?;
+            cmd.args(&arguments);
+            response_dir
+        } else {
+            cmd.args(arguments);
+            None
+        };
+        cmd.env_clear().envs(env_vars.clone()).current_dir(cwd);
         if *share_jobserver {
             cmd.share_jobserver();
         }
-        match service.notification_tx() {
+        let result = match service.notification_tx() {
             Some(tx) => {
                 let tx = tx.clone();
                 let observer: StderrLineObserver = Box::new(move |line| {
@@ -231,7 +239,9 @@ impl CompileCommandImpl for SingleCompileCommand {
                 run_input_output_observing(cmd, None, Some(observer)).await
             }
             None => run_input_output(cmd, None).await,
-        }
+        };
+        drop(response_dir);
+        result
     }
 }
 

@@ -1322,6 +1322,7 @@ fn generate_compile_commands(
         env_vars: env_vars.clone(),
         cwd: cwd.to_owned(),
         share_jobserver: false,
+        rust_response_file: false,
     };
 
     #[cfg(not(feature = "dist-client"))]
